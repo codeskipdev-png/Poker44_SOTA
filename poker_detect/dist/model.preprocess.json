@@ -1,6 +1,3 @@
-{
-  "feature_spec_version": 1,
-  "hand_feature_dim": 20,
-  "onnx_opset": 17,
-  "checkpoint": "C:\\Users\\admin\\Documents\\workspace\\Poker44-subnet_train\\poker_detect\\training\\data\\poker_detect_runs\\default\\best.pt"
-}
+version https://git-lfs.github.com/spec/v1
+oid sha256:baa48331bd3ebef078ee7ce81eed1c9364196f240bbf27516143e3e68ac14057
+size 229

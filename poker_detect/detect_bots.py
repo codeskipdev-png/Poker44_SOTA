@@ -1,7 +1,10 @@
 """Standalone ONNX bot detection for custom HTTP servers (e.g. FastAPI).
 
-Mirrors scoring in ``neurons/miner_onnx.py``: same ``OnnxChunkScorer`` and
-threshold (risk >= 0.5 => bot prediction).
+Uses ``OnnxHandScorer`` per hand. Per-chunk risk is the fraction of hands with
+score > 0.8. For each request, sweep a chunk-level threshold ``t`` over
+``[0, 1]`` and pick the ``t`` that makes ``predictions = risk > t`` closest to
+1:1 bot:human (validator-style shuffled batches). Concretely, minimize
+``|bot_count - n / 2|``.
 
 Environment (same as the ONNX miner):
 
@@ -25,7 +28,7 @@ from typing import Any, List, Tuple
 import numpy as np
 
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REPO_ROOT = Path(__file__).resolve().parent
 
 
 _scorer = None
@@ -47,36 +50,64 @@ def _get_scorer():
 
 _get_scorer()
 
+
+_THRESHOLD_GRID = np.linspace(0.0, 1.0, 1001, dtype=np.float32)
+
+
+def _find_balanced_threshold(chunk_risks: List[float]) -> Tuple[float, List[bool]]:
+    n = len(chunk_risks)
+    if n == 0:
+        return 0.5, []
+    risks = np.asarray(chunk_risks, dtype=np.float32)
+    target = n / 2.0
+
+    best_t = float(_THRESHOLD_GRID[0])
+    best_diff = float("inf")
+    for t in _THRESHOLD_GRID:
+        bots = int(np.sum(risks > t))
+        diff = abs(bots - target)
+        if diff < best_diff:
+            best_diff = diff
+            best_t = float(t)
+            if best_diff == 0.0:
+                break
+
+    preds = (risks > best_t).tolist()
+    return best_t, preds
+
+
 def detect_bots(
     chunks: List[List[dict[str, Any]]],
 ) -> Tuple[List[float], List[bool]]:
     """
     Score each chunk (sequence of hand dicts) with the loaded ONNX model.
 
-    Returns ``(risk_scores, predictions)`` where each prediction is ``True`` if
-    that chunk's bot risk is >= 0.5 (same as the Bittensor ONNX miner).
+    Returns ``(risk_scores, predictions)``. ``risk_scores[i]`` is the fraction
+    of hands in chunk ``i`` with hand score > 0.8. ``predictions[i] = risk > t``
+    where ``t`` is chosen by a sweep over ``[0, 1]`` to minimize
+    ``|bot_count - n / 2|`` (closest to 1:1).
     """
     global _scorer
     chunk_list = chunks or []
     if not chunk_list:
         return [], []
 
-
     chunk_score_matrix = [
         [_scorer.score_hand(h or {}) for h in chunk] for chunk in chunk_list
     ]
 
-    risk_scores, predictions = [], []
+    chunk_risks: List[float] = []
     for chunk_score_row in chunk_score_matrix:
-        score_row = np.array(chunk_score_row, np.float32)
-        bot_mask = score_row > 0.9
+        score_row = np.asarray(chunk_score_row, dtype=np.float32)
         n_hand = len(score_row)
-        pred = np.sum(bot_mask) / n_hand > 0.9
-        score = float(pred)
-        risk_scores.append(score)
-        predictions.append(pred.item())
+        if n_hand == 0:
+            chunk_risks.append(0.0)
+        else:
+            chunk_risks.append(float(np.mean(score_row > 0.8)))
 
-    return risk_scores, predictions
+    threshold, predictions = _find_balanced_threshold(chunk_risks)
+    print(f"threshold={threshold}")
+    return chunk_risks, predictions
 
 
 
@@ -84,230 +115,39 @@ if __name__ == "__main__":
     import json
     from poker44.score.scoring import reward
 
-    chunks = [
-          [
-            {
-              "metadata": {
-                "game_type": "Hold'em",
-                "limit_type": "No Limit",
-                "max_seats": 6,
-                "hero_seat": 2,
-                "hand_ended_on_street": "",
-                "button_seat": 0,
-                "sb": 0.01,
-                "bb": 0.02,
-                "ante": 0,
-                "rng_seed_commitment": None
-              },
-              "players": [
-                {
-                  "player_uid": "seat_1",
-                  "seat": 1,
-                  "starting_stack": 0.06,
-                  "hole_cards": None,
-                  "showed_hand": False
-                },
-                {
-                  "player_uid": "seat_2",
-                  "seat": 2,
-                  "starting_stack": 0.06,
-                  "hole_cards": None,
-                  "showed_hand": False
-                },
-                {
-                  "player_uid": "seat_3",
-                  "seat": 3,
-                  "starting_stack": 0.06,
-                  "hole_cards": None,
-                  "showed_hand": False
-                },
-                {
-                  "player_uid": "seat_4",
-                  "seat": 4,
-                  "starting_stack": 0.06,
-                  "hole_cards": None,
-                  "showed_hand": False
-                },
-                {
-                  "player_uid": "seat_5",
-                  "seat": 5,
-                  "starting_stack": 0.06,
-                  "hole_cards": None,
-                  "showed_hand": False
-                },
-                {
-                  "player_uid": "seat_6",
-                  "seat": 6,
-                  "starting_stack": 0.06,
-                  "hole_cards": None,
-                  "showed_hand": False
-                }
-              ],
-              "streets": [],
-              "actions": [
-                {
-                  "action_id": "1",
-                  "street": "preflop",
-                  "actor_seat": 1,
-                  "action_type": "other",
-                  "amount": 0,
-                  "raise_to": None,
-                  "call_to": None,
-                  "normalized_amount_bb": 0,
-                  "pot_before": 0.9,
-                  "pot_after": 0.9
-                },
-                {
-                  "action_id": "2",
-                  "street": "preflop",
-                  "actor_seat": 4,
-                  "action_type": "other",
-                  "amount": 0,
-                  "raise_to": None,
-                  "call_to": None,
-                  "normalized_amount_bb": 0,
-                  "pot_before": 0.9,
-                  "pot_after": 0.9
-                },
-                {
-                  "action_id": "3",
-                  "street": "preflop",
-                  "actor_seat": 4,
-                  "action_type": "other",
-                  "amount": 0,
-                  "raise_to": None,
-                  "call_to": None,
-                  "normalized_amount_bb": 0,
-                  "pot_before": 0.9,
-                  "pot_after": 0.9
-                },
-                {
-                  "action_id": "4",
-                  "street": "preflop",
-                  "actor_seat": 6,
-                  "action_type": "other",
-                  "amount": 0,
-                  "raise_to": None,
-                  "call_to": None,
-                  "normalized_amount_bb": 0,
-                  "pot_before": 0.9,
-                  "pot_after": 0.9
-                },
-                {
-                  "action_id": "5",
-                  "street": "preflop",
-                  "actor_seat": 3,
-                  "action_type": "other",
-                  "amount": 0,
-                  "raise_to": None,
-                  "call_to": None,
-                  "normalized_amount_bb": 0,
-                  "pot_before": 0.9,
-                  "pot_after": 0.9
-                },
-                {
-                  "action_id": "6",
-                  "street": "preflop",
-                  "actor_seat": 2,
-                  "action_type": "fold",
-                  "amount": 0,
-                  "raise_to": None,
-                  "call_to": None,
-                  "normalized_amount_bb": 0,
-                  "pot_before": 0.9,
-                  "pot_after": 0.9
-                },
-                {
-                  "action_id": "7",
-                  "street": "preflop",
-                  "actor_seat": 2,
-                  "action_type": "fold",
-                  "amount": 0,
-                  "raise_to": None,
-                  "call_to": None,
-                  "normalized_amount_bb": 0,
-                  "pot_before": 0.9,
-                  "pot_after": 0.9
-                },
-                {
-                  "action_id": "8",
-                  "street": "preflop",
-                  "actor_seat": 5,
-                  "action_type": "fold",
-                  "amount": 0,
-                  "raise_to": None,
-                  "call_to": None,
-                  "normalized_amount_bb": 0,
-                  "pot_before": 0.9,
-                  "pot_after": 0.9
-                },
-                {
-                  "action_id": "9",
-                  "street": "preflop",
-                  "actor_seat": 6,
-                  "action_type": "fold",
-                  "amount": 0,
-                  "raise_to": None,
-                  "call_to": None,
-                  "normalized_amount_bb": 0,
-                  "pot_before": 0.9,
-                  "pot_after": 0.9
-                },
-                {
-                  "action_id": "10",
-                  "street": "preflop",
-                  "actor_seat": 3,
-                  "action_type": "fold",
-                  "amount": 0,
-                  "raise_to": None,
-                  "call_to": None,
-                  "normalized_amount_bb": 0,
-                  "pot_before": 0.9,
-                  "pot_after": 0.9
-                },
-                {
-                  "action_id": "11",
-                  "street": "preflop",
-                  "actor_seat": 3,
-                  "action_type": "fold",
-                  "amount": 0,
-                  "raise_to": None,
-                  "call_to": None,
-                  "normalized_amount_bb": 0,
-                  "pot_before": 0.9,
-                  "pot_after": 0.9
-                },
-                {
-                  "action_id": "12",
-                  "street": "preflop",
-                  "actor_seat": 1,
-                  "action_type": "fold",
-                  "amount": 0,
-                  "raise_to": None,
-                  "call_to": None,
-                  "normalized_amount_bb": 0,
-                  "pot_before": 0.9,
-                  "pot_after": 0.9
-                }
-              ],
-              "outcome": {
-                "winners": [],
-                "payouts": {},
-                "total_pot": 0,
-                "rake": 0,
-                "result_reason": "",
-                "showdown": False
-              }
-            }
-          ]
-    ]
-        
-    risk_scores, predictions = detect_bots(chunks)
-    print("\n"+"="*30)
-    print(f"risk_scores={risk_scores}")
-    print(f"predictions={predictions}")
+    path = Path("C:/Users/admin/Documents/workspace/poker/bt_tool/dataset_maker/benchmark_out/benchmark_2026-05-08.raw.json")
 
-    
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    for sub_data in data["data"]["chunks"]:
+        chunks = sub_data["chunks"]
+        groundTruth = sub_data["groundTruth"]
+
+        risk_scores, predictions = detect_bots(chunks)
+        print("\n"+"="*30)
+        print(f"risk_scores={risk_scores}")
+        print(f"predictions={predictions}")
+        print(f"groundTruth={groundTruth}")
+        print(f"reward={reward(np.array(risk_scores), np.array(groundTruth))}")
+        print(f"accuracy={np.sum(np.array(predictions)==np.array(groundTruth)) / len(chunks)}")
+
+    for i in range(85, 99):
+
+        path = Path(
+            f"C:/Users/admin/Documents/workspace/poker/bt_tool/dataset_maker/benchmark_out/output/chunks_{i+1}.json")
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        chunks = data
+
+        risk_scores, predictions = detect_bots(chunks)
+        print("\n" + "=" * 30 + f"chunks {i+1}" + "=" * 30)
+        print(f"risk_scores={risk_scores}")
+        print(f"predictions={predictions}")
+        print(f"sum bots={sum(predictions)}")
+
 
 
 
